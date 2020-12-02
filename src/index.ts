@@ -1,10 +1,10 @@
-import * as Bluebird from 'bluebird';
+import Bluebird from 'bluebird';
 import * as path from 'path';
 import { actions, fs, log, selectors, types, util } from 'vortex-api';
 
-import { IDataArchive } from './types';
+import { IDataArchive, IGameData, IIncompatibleArchive } from './types';
 
-const archiveData = [
+const archiveData: IGameData[] = [
   {
     gameId: 'skyrim',
     gameName: 'Skyrim (2011)',
@@ -29,13 +29,12 @@ const archiveData = [
     version: 103,
     type: 'BSA',
   },
-  // Commented this out as it'll confuse Skyrim players
-  // {
-  //   gameId: 'newvegas',
-  //   gameName: 'Fallout New Vegas',
-  //   version: 104,
-  //   type: 'BSA'
-  // },
+  {
+    gameId: 'newvegas',
+    gameName: 'Fallout New Vegas',
+    version: 104,
+    type: 'BSA',
+  },
   {
     gameId: 'fallout4',
     gameName: 'Fallout 4',
@@ -56,32 +55,35 @@ const archiveData = [
   },
 ];
 
+function runTest(context: types.IExtensionContext) {
+  const state = context.api.getState();
+  const plugInfo = util.getSafe(state, ['session', 'plugins', 'pluginInfo'], {});
+  return checkForErrors(context.api, plugInfo) as any;
+}
+
 function main(context: types.IExtensionContext) {
   context.requireExtension('gamebryo-plugin-management');
+  context.registerTest('incompatible-mod-archives', 'plugins-changed',
+    (): Bluebird<types.ITestResult> => runTest(context));
 
-  context.once(() => {
-    // The only way to check AFTER the auto sort is by registering for the following state change.
-    context.api.onStateChange(['session', 'plugins', 'pluginInfo'],
-      (prev, cur) => checkForErrors(context.api, cur));
-  });
+  context.registerTest('incompatible-mod-archives', 'loot-info-updated',
+    (): Bluebird<types.ITestResult> => runTest(context));
 
   return true;
 }
 
-async function checkForErrors(api, pluginsObj): Promise<void> {
-  api.dismissNotification('archive-errors');
-
+async function checkForErrors(api: types.IExtensionApi, pluginsObj: any) {
   // Check this is a game we want to run this check on.
-  const state = api.store.getState();
+  const state = api.getState();
   const activeGameId = selectors.activeGameId(state);
-  const gameData = archiveData.find(g => g.gameId === activeGameId);
+  const gameData: IGameData = archiveData.find(g => g.gameId === activeGameId);
   if (!gameData) {
-    return;
+    return Bluebird.resolve(undefined);
   }
 
   // Get the plugins for the current game.
   if (!pluginsObj || !Object.keys(pluginsObj)) {
-    return;
+    return Bluebird.resolve(undefined);
   }
 
   const plugins = Object.keys(pluginsObj)
@@ -89,7 +91,9 @@ async function checkForErrors(api, pluginsObj): Promise<void> {
     .sort((a, b) => a.loadOrder > b.loadOrder ? 1 : -1);
 
   // We want only enabled plugins that load archives, but aren't base game files.
-  const archiveLoaders = plugins.filter(p => !p.isNative && p.loadsArchive && p.enabled === true);
+  const archiveLoaders = plugins.filter(p => !p.isNative
+    && p.loadsArchive
+    && util.getSafe(state, ['loadOrder', p.id, 'enabled'], false));
 
   // Get the list of mods and the data folder path.
   const mods = util.getSafe(state, ['persistent', 'mods', activeGameId], {});
@@ -98,20 +102,26 @@ async function checkForErrors(api, pluginsObj): Promise<void> {
 
   const dataFolder = discovery ? path.join(discovery, 'data') : undefined;
 
+  const normalize = (fileName: string) => {
+    const noExt = path.basename(fileName, path.extname(fileName)).toLowerCase();
+    return noExt.normalize('NFC');
+  };
+
   try {
-    // Read the data folder top level.
     const dataFiles = await fs.readdirAsync(dataFolder);
-    // Filter out anything that isn't a BSA/BA2
     const dataArchives = dataFiles.filter(f => ['.ba2', '.bsa'].includes(path.extname(f)));
-    const archivesToCheck: IDataArchive[] = archiveLoaders.map((plugin) => {
-      const pName: string = plugin.name.replace(path.extname(plugin.name), '').toLowerCase();
-      return dataArchives.filter(a => path.basename(a).toLowerCase().startsWith(pName))
-                         .map(a => ({ name: a, plugin: plugin.name }));
-    }).reduce((prev, cur) => prev.concat(cur), []);
+    const archivesToCheck: IDataArchive[] = archiveLoaders.reduce((accum, plugin) => {
+      const arcs: IDataArchive[] = dataArchives
+        .filter(a => normalize(a) === normalize(plugin.name))
+        .map(a => ({ name: a, plugin: plugin.name }));
+
+      accum = accum.concat(arcs);
+      return accum;
+    }, []);
 
     // If there's nothing to check, we can exit here.
     if (!archivesToCheck.length) {
-      return;
+      return Bluebird.resolve(undefined);
     }
 
     let pos = 0;
@@ -128,74 +138,55 @@ async function checkForErrors(api, pluginsObj): Promise<void> {
       ++pos;
     };
 
-    const issues = await Bluebird.mapSeries(archivesToCheck, async (archive) => {
+    const issues: IIncompatibleArchive[] = await archivesToCheck.reduce(async (accumP, archive) => {
+      const accum = await accumP;
       progress(archive.name);
       try {
         const version = await streamArchiveVersion(path.join(dataFolder, archive.name));
         if (version === gameData.version) {
-          return;
+          return accum;
         }
 
         const plugin = plugins.find(p => p.name === archive.plugin);
         const mod = plugin ? mods[plugin.modName] : undefined;
-        return {
+        accum.push({
           name: archive.name,
           version,
           validVersion: gameData.version,
           plugin,
           mod,
-        };
-
+        });
+        return accum;
       } catch (err) {
-        log('error', 'Error checking BSA versions', err);
-        return;
+        log('error', 'Error checking archive versions', err);
+        return accum;
       }
-    }).filter(i => !!i);
+    }, Promise.resolve([]));
 
-    // Dismiss our notice.
     api.dismissNotification('checking-archives-all');
 
-    // If we have errors, we'd better say something.
-    if (issues.length) {
-      api.sendNotification({
-        id: 'archive-errors',
-        type: 'error',
-        group: 'archive-errors',
-        title: 'Incompatible mod archive(s)',
-        message: api.translate('Some {{ext}} files are not valid for this game.',
-          { replace: { ext: gameData.type } }),
-        actions: [
-          {
-            title: 'More',
-            action: () => showMultiErrorDetailsDialog(api, issues, gameData),
-          },
-        ],
-      });
-    } else {
-      log('debug', 'No issues with BA2/BSA files. Total checked:', archivesToCheck.length);
-    }
-
+    return (issues?.length > 0)
+      ? genTestResult(api, issues, gameData)
+      : Bluebird.resolve(undefined);
   } catch (err) {
-    log('error', 'Error checking for BSA errors', err);
-    return;
+    log('error', 'Error checking for archive errors', err);
+    return Bluebird.resolve(undefined);
   }
-
 }
 
-function showMultiErrorDetailsDialog(api: types.IExtensionApi, issues, gameData) {
+function genTestResult(api: types.IExtensionApi,
+                       issues: IIncompatibleArchive[],
+                       gameData: IGameData): Bluebird<types.ITestResult> {
   const t = api.translate;
   const thisGame = gameData.gameName;
-  const groupedErrors = {noMod: []};
-  issues.map((cur) => {
+  const groupedErrors = issues.reduce((accum, cur) => {
     if (cur.mod) {
-      if (!groupedErrors[cur.mod.id]) {
-        groupedErrors[cur.mod.id] = [];
-      }
-      groupedErrors[cur.mod.id].push(cur);
+      accum[cur.mod.id] = [].concat(accum[cur.mod.id] || [], cur);
     } else {
-      groupedErrors.noMod.push(cur);
+      accum.noMod.push(cur);
     }
-  }, {});
+    return accum;
+  }, { noMod: [] });
 
   const errorsByMod = Object.keys(groupedErrors).map(key => {
     const group = groupedErrors[key];
@@ -207,36 +198,35 @@ function showMultiErrorDetailsDialog(api: types.IExtensionApi, issues, gameData)
       return '';
     }
     const archiveErrors = group.map(a => {
-      const games = archiveData.filter(g => g.version === a.version)
-                               .map(g => g.gameName).join('/') || t('an unknown game');
+      const games = archiveData
+        .filter(g => g.version === a.version)
+        .map(g => g.gameName).join('/') || t('an unknown game');
 
       const plugin = a.plugin.name;
-      return `[*][b]${a.name}[/b] - ${t('Is loaded by {{plugin}}, but is intended for use in {{games}}.', { replace: { plugin, games } })}`;
+      return `[*][b]${a.name}[/b] - ${t('Is loaded by {{plugin}}, but is intended for use in {{games}}.',
+        { replace: { plugin, games } })}`;
     });
 
     return `[h3]${t('Incompatible Archives')} ${modName ? `: ${modName}` : t('not managed by Vortex')}[/h3]`
     + `[list]${archiveErrors.join()}[/list]<br/><br/>`;
-
   });
 
-  api.showDialog(
-    'error',
-    'Incompatible mod archives',
-    {
-      bbcode:
-        `${t('Some of the {{ext}} archives in your load order are incompatible with {{thisGame}}. Using incompatible archives may cause your game to crash on load. ',
-        { replace: { thisGame } })}
-        ${errorsByMod.join()}
-        ${t('You can fix this problem yourself by removing any mods that are not intended to be used with {{thisGame}}. ' +
-        'If you downloaded these mods from the correct game site at Nexus Mods, you should inform the mod author of this issue. ' +
-        'Archives for this game must be {{ext}} files (v{{ver}}).',
-        { replace: { thisGame, ext: gameData.type, ver: gameData.version } })}`,
+  return Bluebird.resolve({
+    description: {
+      short: 'Incompatible mod archive(s)',
+      long: t('Some of the archives in your load order are incompatible with {{thisGame}}. '
+           + 'Using incompatible archives may cause your game to crash on load.',
+              { replace: { thisGame } })
+
+           + `${errorsByMod.join()}`
+
+           + t('You can fix this problem yourself by removing any mods that are not intended to be used with {{thisGame}}. '
+           + 'If you downloaded these mods from the correct game site at Nexus Mods, you should inform the mod author of this issue. '
+           + 'Archives for this game must be {{ext}} files (v{{ver}}).',
+              { replace: { thisGame, ext: gameData.type, ver: gameData.version } }),
     },
-    [{
-      label: 'OK',
-      action: () => null,
-    }],
-  );
+    severity: 'error' as types.ProblemSeverity,
+  });
 }
 
 async function streamArchiveVersion(filePath: string): Promise<any> {
