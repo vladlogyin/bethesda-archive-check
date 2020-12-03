@@ -112,7 +112,7 @@ async function checkForErrors(api: types.IExtensionApi, pluginsObj: any) {
     const dataArchives = dataFiles.filter(f => ['.ba2', '.bsa'].includes(path.extname(f)));
     const archivesToCheck: IDataArchive[] = archiveLoaders.reduce((accum, plugin) => {
       const arcs: IDataArchive[] = dataArchives
-        .filter(a => normalize(a) === normalize(plugin.name))
+        .filter(a => normalize(a).startsWith(normalize(plugin.name)))
         .map(a => ({ name: a, plugin: plugin.name }));
 
       accum = accum.concat(arcs);
