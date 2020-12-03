@@ -55,6 +55,9 @@ const archiveData = [
 ]
 
 function main(context: types.IExtensionContext) {
+
+  context.requireVersion('~1.3.20');
+
   context.requireExtension('gamebryo-plugin-management');
 
   context.once(() => {
